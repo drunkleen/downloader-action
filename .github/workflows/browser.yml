@@ -1,0 +1,381 @@
+---
+name: 🌐 Web Browser
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to visit'
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  browse:
+    name: "🌐 Browse Web"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq curl zip
+
+      - name: Setup Node and Puppeteer
+        run: |
+          npm init -y --quiet
+          npm install puppeteer@22 --quiet
+
+      - name: Create screenshot script
+        run: |
+          cat > screenshot.js << 'ENDOFSCRIPT'
+          const puppeteer = require('puppeteer');
+          const [,, url, outputPath] = process.argv;
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 720 });
+            try {
+              await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+              await page.screenshot({ path: outputPath, fullPage: true });
+              console.log('Screenshot saved:', outputPath);
+            } catch (err) {
+              console.error('Screenshot error:', err.message);
+              process.exit(1);
+            } finally {
+              await browser.close();
+            }
+          })();
+          ENDOFSCRIPT
+
+      - name: Visit URL and download media
+        run: |
+          RAW_URL="${{ github.event.inputs.url }}"
+
+          # Normalize URL — add https:// if no protocol given
+          if [[ ! "$RAW_URL" =~ ^https?:// ]]; then
+            HTTPS_URL="https://$RAW_URL"
+            HTTP_URL="http://$RAW_URL"
+            STATUS=$(curl -L --connect-timeout 10 --max-time 20 -o /dev/null -s -w "%{http_code}" "$HTTPS_URL" || echo "000")
+            if [[ "$STATUS" =~ ^(200|301|302|303|307|308)$ ]]; then
+              URL="$HTTPS_URL"
+            else
+              URL="$HTTP_URL"
+            fi
+          else
+            URL="$RAW_URL"
+          fi
+
+          echo "Visiting: $URL"
+
+          # Extract domain and root URL
+          DOMAIN=$(echo "$URL" | awk -F/ '{print $3}' | sed 's/^www\.//')
+          PROTOCOL=$(echo "$URL" | grep -oP '^https?')
+          HOST=$(echo "$URL" | awk -F/ '{print $3}')
+          ROOT_URL="${PROTOCOL}://${HOST}"
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          FOLDER="pages/$DOMAIN/$TIMESTAMP"
+          MEDIA_FOLDER="$FOLDER/media"
+          mkdir -p "$FOLDER" "$MEDIA_FOLDER"
+
+          # ── Download HTML ──────────────────────────────────────────────────
+          echo "Downloading HTML..."
+          curl -L -s -A "Mozilla/5.0" --max-time 30 -o "$FOLDER/page.html" "$URL" || true
+
+          # ── Download favicon (3-method fallback) ──────────────────────────
+          FAVICON_OK=false
+          FAVICON_FILE=""
+
+          # Method 1: /favicon.ico at root
+          curl -L -s --max-time 10 -o "$MEDIA_FOLDER/favicon.ico" "${ROOT_URL}/favicon.ico" 2>/dev/null || true
+          if [ -s "$MEDIA_FOLDER/favicon.ico" ]; then
+            FILE_TYPE=$(file -b "$MEDIA_FOLDER/favicon.ico" 2>/dev/null || echo "")
+            if [[ "$FILE_TYPE" == *"image"* ]] || [[ "$FILE_TYPE" == *"icon"* ]]; then
+              FAVICON_OK=true
+              FAVICON_FILE="favicon.ico"
+              echo "Favicon: /favicon.ico"
+            else
+              rm -f "$MEDIA_FOLDER/favicon.ico"
+            fi
+          fi
+
+          # Method 2: Extract from HTML <link> tag
+          if [ "$FAVICON_OK" = false ] && [ -f "$FOLDER/page.html" ]; then
+            FAVICON_HREF=$(grep -oP '<link[^>]*rel=["\x27](?:shortcut )?icon["\x27][^>]*href=["\x27]\K[^"\x27]+' \
+              "$FOLDER/page.html" 2>/dev/null | head -1)
+            [ -z "$FAVICON_HREF" ] && FAVICON_HREF=$(grep -oP \
+              '<link[^>]*href=["\x27]\K[^"\x27]+(?=["\x27][^>]*rel=["\x27](?:shortcut )?icon)' \
+              "$FOLDER/page.html" 2>/dev/null | head -1)
+
+            if [ -n "$FAVICON_HREF" ]; then
+              if   [[ "$FAVICON_HREF" =~ ^https?:// ]]; then FAVICON_URL="$FAVICON_HREF"
+              elif [[ "$FAVICON_HREF" = /* ]];           then FAVICON_URL="${ROOT_URL}${FAVICON_HREF}"
+              else                                            FAVICON_URL="${ROOT_URL}/${FAVICON_HREF}"
+              fi
+              FAVICON_EXT=$(echo "${FAVICON_HREF##*.}" | sed 's/[?#].*//' | tr '[:upper:]' '[:lower:]')
+              ( [ -z "$FAVICON_EXT" ] || [ ${#FAVICON_EXT} -gt 5 ] ) && FAVICON_EXT="png"
+
+              curl -L -s --max-time 10 -o "$MEDIA_FOLDER/favicon.${FAVICON_EXT}" "$FAVICON_URL" 2>/dev/null || true
+              if [ -s "$MEDIA_FOLDER/favicon.${FAVICON_EXT}" ]; then
+                FAVICON_OK=true
+                FAVICON_FILE="favicon.${FAVICON_EXT}"
+                echo "Favicon: HTML link tag -> $FAVICON_FILE"
+              fi
+            fi
+          fi
+
+          # Method 3: Google favicon service
+          if [ "$FAVICON_OK" = false ]; then
+            curl -L -s --max-time 10 \
+              -o "$MEDIA_FOLDER/favicon.png" \
+              "https://www.google.com/s2/favicons?domain=${DOMAIN}&sz=32" 2>/dev/null || true
+            if [ -s "$MEDIA_FOLDER/favicon.png" ]; then
+              FAVICON_OK=true
+              FAVICON_FILE="favicon.png"
+              echo "Favicon: Google service"
+            fi
+          fi
+
+          echo "FAVICON_OK=$FAVICON_OK"   >> "$GITHUB_ENV"
+          echo "FAVICON_FILE=$FAVICON_FILE" >> "$GITHUB_ENV"
+
+          # ── Take screenshot ────────────────────────────────────────────────
+          echo "Taking screenshot..."
+          SCREENSHOT_OK=false
+          node screenshot.js "$URL" "$FOLDER/screenshot.png" && SCREENSHOT_OK=true || true
+
+          # ── Extract and download linked media ──────────────────────────────
+          MEDIA_EXT="png|jpg|jpeg|gif|svg|webp|bmp|ico|mp3|wav|ogg|flac|aac|mp4|webm|avi|mov|mkv|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|tar|gz|7z"
+
+          grep -oP 'href="\K[^"]*' "$FOLDER/page.html" 2>/dev/null | sort -u  > "$FOLDER/all_links.txt"
+          grep -oP 'src="\K[^"]*'  "$FOLDER/page.html" 2>/dev/null | sort -u >> "$FOLDER/all_links.txt"
+          grep -oP "href='\K[^']*" "$FOLDER/page.html" 2>/dev/null | sort -u >> "$FOLDER/all_links.txt"
+          grep -oP "src='\K[^']*"  "$FOLDER/page.html" 2>/dev/null | sort -u >> "$FOLDER/all_links.txt"
+          sort -u "$FOLDER/all_links.txt" -o "$FOLDER/all_links.txt"
+
+          > "$FOLDER/media_links.txt"
+          > "$FOLDER/other_links.txt"
+          > "$FOLDER/downloaded_media.md"
+
+          while IFS= read -r link; do
+            [ -z "$link" ] && continue
+
+            if   [[ "$link" =~ ^https?:// ]];  then ABS="$link"
+            elif [[ "$link" = /* ]];           then ABS="${ROOT_URL}${link}"
+            else ABS=$(python3 -c "import sys; from urllib.parse import urljoin; print(urljoin(sys.argv[1], sys.argv[2]))" "$URL" "$link" 2>/dev/null || echo "")
+            fi
+            [ -z "$ABS" ] && continue
+
+            ext_lower=$(echo "${link##*.}" | sed 's/[?#].*//' | tr '[:upper:]' '[:lower:]')
+
+            if echo "$ext_lower" | grep -Eq "^(${MEDIA_EXT})$"; then
+              FILENAME=$(basename "$link" | sed 's/[?#].*//')
+              [ -f "$MEDIA_FOLDER/$FILENAME" ] && FILENAME="$(date +%s%N | tail -c8)_$FILENAME"
+
+              curl -L -s --retry 2 --max-time 60 -o "$MEDIA_FOLDER/$FILENAME" "$ABS" 2>/dev/null || true
+              FILE_SIZE=$(stat -c%s "$MEDIA_FOLDER/$FILENAME" 2>/dev/null || echo 0)
+
+              if [ "$FILE_SIZE" -gt 0 ]; then
+                echo "$link" >> "$FOLDER/media_links.txt"
+                if echo "$ext_lower" | grep -Eq "^(png|jpg|jpeg|gif|svg|webp)$"; then
+                  echo "![$FILENAME](./media/$FILENAME)" >> "$FOLDER/downloaded_media.md"
+                else
+                  echo "- [$FILENAME](./media/$FILENAME) ($(( FILE_SIZE / 1024 )) KB)" >> "$FOLDER/downloaded_media.md"
+                fi
+                echo "Downloaded: $FILENAME"
+              fi
+            else
+              echo "$link" >> "$FOLDER/other_links.txt"
+            fi
+          done < "$FOLDER/all_links.txt"
+
+          # ── Build index.md ─────────────────────────────────────────────────
+          MEDIA_COUNT=$(find "$MEDIA_FOLDER" -type f 2>/dev/null | wc -l)
+
+          {
+            echo "# Visited: $URL"
+            echo ""
+            echo "**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            if [ "$FAVICON_OK" = true ] && [ -n "$FAVICON_FILE" ]; then
+              echo "## Favicon"
+              echo "![Favicon](./media/$FAVICON_FILE)"
+              echo ""
+            fi
+            if [ "$SCREENSHOT_OK" = true ] && [ -f "$FOLDER/screenshot.png" ]; then
+              echo "## Screenshot"
+              echo "![Screenshot](./screenshot.png)"
+              echo ""
+            fi
+            echo "## Raw HTML"
+            echo "[page.html](./page.html)"
+            echo ""
+            echo "## Downloaded Media ($MEDIA_COUNT files)"
+            if [ "$MEDIA_COUNT" -gt 0 ]; then
+              cat "$FOLDER/downloaded_media.md"
+            else
+              echo "_No media files found_"
+            fi
+            echo ""
+            echo "## Other Links"
+            if [ -s "$FOLDER/other_links.txt" ]; then
+              head -50 "$FOLDER/other_links.txt" | while IFS= read -r l; do
+                echo "- [$l]($l)"
+              done
+            else
+              echo "_None_"
+            fi
+            echo ""
+            echo "## Stats"
+            echo "- Total links: $(wc -l < "$FOLDER/all_links.txt")"
+            echo "- Media downloaded: $MEDIA_COUNT"
+          } > "$FOLDER/index.md"
+
+          echo "DOMAIN=$DOMAIN"         >> "$GITHUB_ENV"
+          echo "TIMESTAMP=$TIMESTAMP"   >> "$GITHUB_ENV"
+          echo "FOLDER=$FOLDER"         >> "$GITHUB_ENV"
+          echo "MEDIA_COUNT=$MEDIA_COUNT" >> "$GITHUB_ENV"
+
+          echo "Done — $MEDIA_COUNT media files"
+
+      - name: Update browse.md
+        run: |
+          BROWSE_FILE="browse.md"
+          FOLDER="${{ env.FOLDER }}"
+          DOMAIN="${{ env.DOMAIN }}"
+          FAVICON_OK="${{ env.FAVICON_OK }}"
+          FAVICON_FILE="${{ env.FAVICON_FILE }}"
+
+          if [ ! -f "$BROWSE_FILE" ]; then
+            printf '# Browsed Websites\n\n---\n\n' > "$BROWSE_FILE"
+          fi
+
+          # Count existing entries by matching lines that link to index.md
+          ENTRY_COUNT=$(grep -c 'index\.md' "$BROWSE_FILE" 2>/dev/null || echo 0)
+          NEXT_NUM=$(( ENTRY_COUNT + 1 ))
+
+          if [ "$FAVICON_OK" = "true" ] && [ -n "$FAVICON_FILE" ]; then
+            ENTRY="![favicon]($FOLDER/media/$FAVICON_FILE) ${NEXT_NUM}- [${DOMAIN}]($FOLDER/index.md)"
+          else
+            ENTRY="🌐 ${NEXT_NUM}- [${DOMAIN}]($FOLDER/index.md)"
+          fi
+
+          echo "" >> "$BROWSE_FILE"
+          echo "$ENTRY" >> "$BROWSE_FILE"
+          echo "Added entry #${NEXT_NUM}: ${DOMAIN}"
+
+      - name: Update README.md with browser link
+        run: |
+          README_FILE="README.md"
+          BROWSER_SECTION="you can see websites using this : 🌐 Browser"
+
+          [ -f "$README_FILE" ] || printf '# Repository\n\n' > "$README_FILE"
+
+          if ! grep -qF "$BROWSER_SECTION" "$README_FILE"; then
+            {
+              head -1 "$README_FILE"
+              echo ""
+              echo "---"
+              echo ""
+              echo "[$BROWSER_SECTION](browse.md)"
+              echo ""
+              echo "---"
+              echo ""
+              tail -n +2 "$README_FILE"
+            } > "$README_FILE.tmp"
+            mv "$README_FILE.tmp" "$README_FILE"
+            echo "Browser section added to README.md"
+          else
+            echo "Browser section already present"
+          fi
+
+      - name: Create zip archive of captured page
+        run: |
+          DOMAIN="${{ env.DOMAIN }}"
+          TIMESTAMP="${{ env.TIMESTAMP }}"
+          cd "pages/$DOMAIN"
+          zip -r "${TIMESTAMP}.zip" "$TIMESTAMP"
+          cd ../..
+
+      - name: Update pages/README.md
+        run: |
+          PAGES_README="pages/README.md"
+          DOMAIN="${{ env.DOMAIN }}"
+          TIMESTAMP="${{ env.TIMESTAMP }}"
+          FAVICON_OK="${{ env.FAVICON_OK }}"
+          FAVICON_FILE="${{ env.FAVICON_FILE }}"
+
+          if [ ! -f "$PAGES_README" ]; then
+            mkdir -p pages
+            printf '# Saved Websites\n\n---\n\n' > "$PAGES_README"
+          fi
+
+          if [ "$FAVICON_OK" = "true" ] && [ -n "$FAVICON_FILE" ]; then
+            ICON="![$DOMAIN](./$DOMAIN/$TIMESTAMP/media/$FAVICON_FILE)"
+          else
+            ICON="🌐"
+          fi
+
+          ENTRY="$ICON **$DOMAIN** — [ [View](./$DOMAIN/$TIMESTAMP/index.md) | [Download](./$DOMAIN/$TIMESTAMP.zip) ]"
+          echo "" >> "$PAGES_README"
+          echo "$ENTRY" >> "$PAGES_README"
+          echo "Added to pages/README.md: $DOMAIN"
+
+      - name: Commit and push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # Save tracked files that were modified so we can restore them after any git reset
+          cp browse.md       /tmp/browse_save.md       2>/dev/null || true
+          cp README.md       /tmp/readme_save.md       2>/dev/null || true
+          cp pages/README.md /tmp/pages_readme_save.md 2>/dev/null || true
+
+          git add -f pages/ browse.md README.md 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "Saved page: ${{ env.DOMAIN }} [skip ci]"
+
+          for retry in 1 2 3 4 5; do
+            if timeout 120 git push origin "HEAD:$BRANCH" 2>&1; then
+              echo "Pushed (attempt ${retry})"
+              exit 0
+            fi
+            echo "Push failed (${retry}/5), resyncing..."
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard "origin/$BRANCH"
+
+            # Restore modified tracked files (pages/ folder survives reset as untracked)
+            [ -f /tmp/browse_save.md ]       && cp /tmp/browse_save.md       browse.md
+            [ -f /tmp/readme_save.md ]       && cp /tmp/readme_save.md       README.md
+            [ -f /tmp/pages_readme_save.md ] && cp /tmp/pages_readme_save.md pages/README.md
+
+            git add -f pages/ browse.md README.md 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              git commit -m "Saved page: ${{ env.DOMAIN }} [skip ci]" --quiet
+            fi
+            sleep $(( 2 + RANDOM % 5 ))
+          done
+
+          echo "ERROR: push failed after 5 attempts"
+          exit 1

@@ -1,0 +1,421 @@
+---
+name: 🔥 Full Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '🔗 Download URLs (space-separated for multiple)'
+        required: true
+        type: string
+      password:
+        description: '🔒 Zip password (optional)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  save-file:
+    name: "📥 Download File"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ github.event.inputs.urls }}" ]; then
+            echo "❌ No download URL provided."
+            echo "Re-run the workflow and enter URLs in the 'urls' field (space-separated for multiple)."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@github.com"
+          git config http.postBuffer    524288000
+          git config http.maxRequestBuffer 100M
+          git config core.compression   0
+          git config pack.windowMemory  256m
+          git config pack.packSizeLimit 100m
+          git config pack.threads       1
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2 zip curl bc
+
+      - name: Download and package files
+        run: |
+          URLS="${{ github.event.inputs.urls }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          SPLIT_MB=95
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          STAGING="/tmp/staging_$$"
+
+          mkdir -p "$STAGING" tmp_downloads
+          echo "$STAGING" > /tmp/staging_path.txt
+
+          # ── Helpers ────────────────────────────────────────────────────────
+
+          urlencode() {
+            python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$1"
+          }
+
+          # Return a non-colliding folder name under $base for name $name
+          unique_folder() {
+            local base="$1" name="$2" n=2 candidate="$name"
+            while [ -d "$base/$candidate" ]; do
+              candidate="${name}_${n}"
+              n=$(( n + 1 ))
+            done
+            echo "$candidate"
+          }
+
+          # Zip helper that applies password / split flags consistently
+          do_zip_multi() {  # dest split_mb src...
+            local dest="$1" split="$2"; shift 2
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -j -P "$ZIP_PASSWORD" -s "${split}m" "$dest" "$@"
+            else
+              zip -j -s "${split}m" "$dest" "$@"
+            fi
+          }
+
+          # Write README for a folder containing split-zip parts
+          readme_zip_parts() {  # folder folder_name archive_name
+            local folder="$1" fname="$2" aname="$3"
+            local fenc; fenc=$(urlencode "$fname")
+            local protected="NO"; [ -n "$ZIP_PASSWORD" ] && protected="YES"
+
+            local links="" n=0 total=0
+            while IFS= read -r -d '' part; do
+              local pb penc psz
+              pb=$(basename "$part")
+              penc=$(urlencode "$pb")
+              psz=$(stat -c%s "$part" 2>/dev/null || echo 0)
+              n=$(( n + 1 )); total=$(( total + psz ))
+              links+="| $n | \`$pb\` | [Download](https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${fenc}/${penc}) |"$'\n'
+            done < <(find "$folder" -maxdepth 1 \( -name "*.zip" -o -name "*.z[0-9]*" \) -print0 2>/dev/null | sort -z)
+
+            local size_mb; size_mb=$(echo "scale=2; $total/1048576" | bc)
+
+            {
+              printf '# %s\n\n' "${aname}"
+              printf '| Property | Value |\n'
+              printf '|----------|-------|\n'
+              printf '| **Archive** | `%s.zip` |\n' "${aname}"
+              printf '| **Total Size** | %s MB — %s part(s) |\n' "${size_mb}" "${n}"
+              printf '| **Password Protected** | **%s** |\n' "${protected}"
+              printf '| **Status** | Complete |\n\n'
+              printf '## Download Links\n\n'
+              printf '| # | File | Link |\n'
+              printf '|---|------|------|\n'
+              printf '%s' "${links}"
+              printf '## How to Extract\n\n'
+              printf '1. Download **all** parts (`.zip`, `.z01`, `.z02`...)\n'
+              printf '2. Open `%s.zip` with 7-Zip, WinRAR, or Ark — parts combine automatically\n' "${aname}"
+              [ -n "$ZIP_PASSWORD" ] && printf '3. Enter the password when prompted\n'
+            } > "$folder/README.md"
+          }
+
+          # Write error README for a failed download
+          readme_error() {  # folder filename url
+            local folder="$1" fn="$2" url="$3"
+            {
+              printf '# %s — Download Failed\n\n' "${fn}"
+              printf '| Property | Value |\n'
+              printf '|----------|-------|\n'
+              printf '| **File** | `%s` |\n' "${fn}"
+              printf '| **URL** | %s |\n' "${url}"
+              printf '| **Date** | %s |\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              printf '| **Status** | FAILED |\n\n'
+              printf '## Possible Causes\n\n'
+              printf -- '- URL incorrect or file removed\n'
+              printf -- '- Server requires authentication (403 Forbidden)\n'
+              printf -- '- Server blocks automated downloads\n'
+              printf -- '- Temporary server issue — try again later\n'
+            } > "$folder/README.md"
+          }
+
+          # Download with aria2c → curl fallback, up to 3 total attempts
+          download_file() {
+            local url="$1" filename="$2" dest="tmp_downloads/$2"
+            local delay=5
+
+            for attempt in 1 2 3; do
+              echo "  [${attempt}/3] $filename"
+              rm -f "$dest" "${dest}.aria2"
+
+              aria2c \
+                --split=2 --max-connection-per-server=2 \
+                --min-split-size=20M --max-tries=2 \
+                --retry-wait=5 --timeout=60 --connect-timeout=30 \
+                --check-certificate=false \
+                --allow-overwrite=true --auto-file-renaming=false \
+                --dir=tmp_downloads --out="$filename" \
+                "$url" >/dev/null 2>&1 || true
+
+              [ -s "$dest" ] && { echo "  aria2c OK: $filename"; return 0; }
+              rm -f "$dest" "${dest}.aria2"
+
+              curl -L -f --retry 2 --retry-delay 5 \
+                --connect-timeout 30 --max-time 3600 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                -o "$dest" "$url" >/dev/null 2>&1 || true
+
+              [ -s "$dest" ] && { echo "  curl OK: $filename"; return 0; }
+              rm -f "$dest"
+
+              if [ $attempt -lt 3 ]; then
+                echo "  Attempt $attempt failed, retrying in ${delay}s..."
+                sleep $delay
+                delay=$(( delay * 2 ))
+              fi
+            done
+
+            echo "  FAILED: $filename"
+            return 1
+          }
+
+          # ── Phase 1: Download ──────────────────────────────────────────────
+
+          echo "=== Phase 1: Downloading ==="
+
+          FAILED_NAMES=()
+          FAILED_URLS=()
+
+          for URL in $URLS; do
+            FILENAME=$(basename "$URL" | sed 's/[?#].*//' | \
+                       sed 's/%20/ /g; s/%2F/-/g; s/[<>:"\\|?*]/_/g')
+            [ -z "$FILENAME" ] && FILENAME="file_$(date +%s)"
+            echo ""
+            echo "URL:  $URL"
+            echo "File: $FILENAME"
+            if ! download_file "$URL" "$FILENAME"; then
+              FAILED_NAMES+=("$FILENAME")
+              FAILED_URLS+=("$URL")
+            fi
+          done
+
+          # ── Phase 2: Package ───────────────────────────────────────────────
+
+          echo ""
+          echo "=== Phase 2: Packaging ==="
+
+          # Collect all successful downloads into one combined split-zip
+          VALID=()
+          for f in tmp_downloads/*; do
+            [ -f "$f" ] && [ -s "$f" ] && VALID+=("$f")
+          done
+
+          if [ ${#VALID[@]} -gt 0 ]; then
+            ARCHIVE="archive_$(date +%Y%m%d_%H%M%S)"
+            FOLDER=$(unique_folder "$STAGING" "$ARCHIVE")
+            mkdir -p "$STAGING/$FOLDER"
+            echo "Creating archive: $ARCHIVE (${#VALID[@]} files)"
+            do_zip_multi "$STAGING/$FOLDER/${ARCHIVE}.zip" "$SPLIT_MB" "${VALID[@]}"
+            readme_zip_parts "$STAGING/$FOLDER" "$FOLDER" "$ARCHIVE"
+            echo "Packaged: $FOLDER"
+          else
+            echo "No valid downloads to archive."
+          fi
+
+          # Error READMEs for all failed downloads
+          for i in "${!FAILED_NAMES[@]}"; do
+            fn="${FAILED_NAMES[$i]}"
+            url="${FAILED_URLS[$i]}"
+            no_ext="${fn%.*}"
+            FOLDER=$(unique_folder "$STAGING" "${no_ext}_error")
+            mkdir -p "$STAGING/$FOLDER"
+            readme_error "$STAGING/$FOLDER" "$fn" "$url"
+            echo "Error readme: $FOLDER"
+          done
+
+          rm -rf tmp_downloads
+
+          echo ""
+          echo "=== Staging contents ==="
+          find "$STAGING" -type f | sort
+
+      - name: Build downloads index
+        run: |
+          STAGING=$(cat /tmp/staging_path.txt)
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+
+          mkdir -p downloads
+
+          if [ -d "$STAGING" ] && [ -n "$(ls -A "$STAGING" 2>/dev/null)" ]; then
+            cp -r "$STAGING"/. downloads/
+          fi
+
+          urlencode() {
+            python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$1"
+          }
+
+          # ── Regenerate downloads/README.md ─────────────────────────────────
+          {
+            echo "# Downloaded list :"
+            echo ""
+            while IFS= read -r folder; do
+              enc=$(urlencode "$folder")
+              echo "- [${folder}](./${enc})"
+            done < <(find downloads -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+            echo ""
+            echo "---"
+          } > downloads/README.md
+
+          # ── Update root README.md ──────────────────────────────────────────
+          SECTION="## Downloaded Files"
+          [ -f README.md ] || echo "# Downloader" > README.md
+
+          # Remove existing section (if any) cleanly via Python
+          if grep -qF "$SECTION" README.md; then
+            python3 -c "
+            import re
+            with open('README.md') as f:
+                txt = f.read()
+            txt = re.sub(
+                r'\n*\n---\n\n## Downloaded Files.*?(\n---\n?|\Z)',
+                '',
+                txt,
+                flags=re.DOTALL
+            )
+            with open('README.md', 'w') as f:
+                f.write(txt.rstrip('\n') + '\n')
+            "
+          fi
+
+          # Append a fresh section (process substitution avoids subshell counter bug)
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "$SECTION"
+            echo ""
+            counter=1
+            while IFS= read -r folder; do
+              [ -z "$folder" ] && continue
+              enc=$(urlencode "$folder")
+              echo "${counter}. [${folder}](${REPO_URL}/${enc})"
+              echo ""
+              counter=$(( counter + 1 ))
+            done < <(find downloads -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+            echo "---"
+          } >> README.md
+
+      - name: Commit and push
+        run: |
+          STAGING=$(cat /tmp/staging_path.txt)
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # Save README.md so retries can restore it after git reset --hard
+          cp README.md /tmp/readme_save.md 2>/dev/null || true
+
+          # Measure total non-README payload
+          TOTAL_BYTES=0
+          while IFS= read -r -d '' f; do
+            s=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            TOTAL_BYTES=$(( TOTAL_BYTES + s ))
+          done < <(find downloads -type f -not -name "README.md" -print0 2>/dev/null)
+          TOTAL_MB=$(( TOTAL_BYTES / 1048576 ))
+          FILE_COUNT=$(find downloads -type f -not -name "README.md" 2>/dev/null | wc -l)
+          echo "Payload: ${TOTAL_MB}MB across ${FILE_COUNT} files"
+
+          # Restore staging + saved README after any git reset --hard
+          restore_all() {
+            mkdir -p downloads
+            [ -d "$STAGING" ] && cp -r "$STAGING"/. downloads/ 2>/dev/null || true
+            [ -f /tmp/readme_save.md ] && cp /tmp/readme_save.md README.md || true
+          }
+
+          # Push everything in one commit; retries with fetch + reset + restore
+          push_all() {
+            local msg="$1" max="${2:-10}" retry=0
+            while [ $retry -lt $max ]; do
+              retry=$(( retry + 1 ))
+              git fetch origin "$BRANCH" --quiet
+              git reset --hard "origin/$BRANCH"
+              restore_all
+              git add -f downloads/
+              git add README.md 2>/dev/null || true
+              if git diff --cached --quiet; then
+                echo "Nothing to commit."
+                return 0
+              fi
+              git commit -m "$msg [skip ci]" --quiet
+              if timeout 300 git push origin "HEAD:$BRANCH" 2>&1; then
+                echo "Pushed (attempt ${retry})"
+                return 0
+              fi
+              echo "Push failed (${retry}/${max})..."
+              sleep $(( 3 + RANDOM % 7 ))
+            done
+            echo "ERROR: failed after $max attempts"
+            return 1
+          }
+
+          # ── Small upload: single commit ────────────────────────────────────
+          if [ "$TOTAL_MB" -lt 200 ]; then
+            echo "Small upload — pushing in one commit"
+            push_all "Downloaded files" 10 || exit 1
+            exit 0
+          fi
+
+          # ── Large upload: incremental batches ─────────────────────────────
+          echo "Large upload (${TOTAL_MB}MB) — incremental batch push"
+
+          BATCH_SIZE=3
+          BATCH=()
+          BATCH_NUM=0
+
+          flush_batch() {
+            [ ${#BATCH[@]} -eq 0 ] && return 0
+            BATCH_NUM=$(( BATCH_NUM + 1 ))
+            local cnt=${#BATCH[@]} retry=0
+            while [ $retry -lt 5 ]; do
+              retry=$(( retry + 1 ))
+              git fetch origin "$BRANCH" --quiet
+              git reset --hard "origin/$BRANCH"
+              restore_all
+              for f in "${BATCH[@]}"; do git add -f "$f" 2>/dev/null || true; done
+              if git diff --cached --quiet; then
+                BATCH=()
+                return 0
+              fi
+              git commit -m "Batch ${BATCH_NUM}: ${cnt} files [skip ci]" --quiet
+              if timeout 300 git push origin "HEAD:$BRANCH" 2>&1; then
+                echo "Batch ${BATCH_NUM} pushed"
+                BATCH=()
+                return 0
+              fi
+              echo "Batch ${BATCH_NUM} failed (${retry}/5)..."
+              sleep $(( 3 + RANDOM % 7 ))
+            done
+            echo "WARNING: batch ${BATCH_NUM} failed after 5 attempts"
+            BATCH=()
+          }
+
+          while IFS= read -r -d '' f; do
+            BATCH+=("$f")
+            [ ${#BATCH[@]} -ge $BATCH_SIZE ] && flush_batch
+          done < <(find downloads -type f -not -name "README.md" -print0 | sort -zV)
+
+          flush_batch  # flush any remaining files
+
+          # Final commit to ensure READMEs and root README are up to date
+          push_all "Update download index" 5 || exit 1
+
+          echo ""
+          echo "Done"

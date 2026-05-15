@@ -1,0 +1,8 @@
+/downloads/**
+/assets
+/download
+/browse
+/images
+/webs
+/audios
+!/downloads/README.md

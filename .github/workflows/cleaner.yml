@@ -1,0 +1,50 @@
+---
+name: 🗑️ Delete Downloads
+
+on:
+  workflow_dispatch:
+    inputs:
+      warning:
+        description: '⚠️ WARNING: This will reset the entire repository to its first commit, removing ALL downloads and history. Click "Run workflow" only if you are sure.'
+        required: false
+        default: 'Read this warning before proceeding'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  reset:
+    name: "🗑️ Reset to first commit"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Reset to first commit and force push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+
+          FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+          echo "First commit: $FIRST_COMMIT"
+
+          git reset --hard "$FIRST_COMMIT"
+
+          if timeout 60 git push --force origin "HEAD:$BRANCH"; then
+            echo ""
+            echo "Repository reset to first commit successfully."
+          else
+            echo "ERROR: push failed"
+            exit 1
+          fi
